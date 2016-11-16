@@ -523,9 +523,19 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         if (startTls && !sentFirstMessage) {
             sentFirstMessage = true;
             pendingUnencryptedWrites.removeAndWriteAll();
-            ctx.flush();
+            forceFlush(ctx);
             return;
         }
+
+        try {
+            wrapAndFlush(ctx);
+        } catch (SSLException e) {
+            setHandshakeFailure(ctx, e);
+            throw e;
+        }
+    }
+
+    private void wrapAndFlush(ChannelHandlerContext ctx) throws SSLException {
         if (pendingUnencryptedWrites.isEmpty()) {
             // It's important to NOT use a voidPromise here as the user
             // may want to add a ChannelFutureListener to the ChannelPromise later.
@@ -538,18 +548,14 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         }
         try {
             wrap(ctx, false);
-        } catch (Throwable cause) {
-            // Fail pending writes.
-            pendingUnencryptedWrites.removeAndFailAll(cause);
-
-            PlatformDependent.throwException(cause);
         } finally {
             // We may have written some parts of data before an exception was thrown so ensure we always flush.
             // See https://github.com/netty/netty/issues/3900#issuecomment-172481830
-            ctx.flush();
+            forceFlush(ctx);
         }
     }
 
+    // This method will not call setHandshakeFailure(...) !
     private void wrap(ChannelHandlerContext ctx, boolean inUnwrap) throws SSLException {
         ByteBuf out = null;
         ChannelPromise promise = null;
@@ -607,9 +613,6 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                     }
                 }
             }
-        } catch (SSLException e) {
-            setHandshakeFailure(ctx, e);
-            throw e;
         } finally {
             finishWrap(ctx, out, promise, inUnwrap, needUnwrap);
         }
@@ -641,6 +644,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         }
     }
 
+    // This method will not call setHandshakeFailure(...) !
     private void wrapNonAppData(ChannelHandlerContext ctx, boolean inUnwrap) throws SSLException {
         ByteBuf out = null;
         ByteBufAllocator alloc = ctx.alloc();
@@ -697,13 +701,6 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                     break;
                 }
             }
-        } catch (SSLException e) {
-            setHandshakeFailure(ctx, e);
-
-            // We may have written some parts of data before an exception was thrown so ensure we always flush.
-            // See https://github.com/netty/netty/issues/3900#issuecomment-172481830
-            flushIfNeeded(ctx);
-            throw e;
         }  finally {
             if (out != null) {
                 out.release();
@@ -949,7 +946,21 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
             in.skipBytes(totalLength);
 
-            firedChannelRead = unwrap(ctx, in, startOffset, totalLength) || firedChannelRead;
+            try {
+                firedChannelRead = unwrap(ctx, in, startOffset, totalLength) || firedChannelRead;
+            } catch (SSLException e) {
+                try {
+                    // We need to flush one time as there may be an alert that we should send to the remote peer because
+                    // of the SSLException reported here.
+                    wrapAndFlush(ctx);
+                } catch (SSLException ex) {
+                    logger.debug("SSLException during trying to call SSLEngine.wrap(...)" +
+                            " because of an previous SSLException, ignoring...", ex);
+                } finally {
+                    setHandshakeFailure(ctx, e);
+                }
+                throw e;
+            }
         }
 
         if (nonSslRecord) {
@@ -989,8 +1000,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
     private void flushIfNeeded(ChannelHandlerContext ctx) {
         if (needsFlush) {
-            needsFlush = false;
-            ctx.flush();
+            forceFlush(ctx);
         }
     }
 
@@ -1109,9 +1119,6 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             if (notifyClosure) {
                 sslCloseFuture.trySuccess(ctx.channel());
             }
-        } catch (SSLException e) {
-            setHandshakeFailure(ctx, e);
-            throw e;
         } finally {
             if (decodeOut.isReadable()) {
                 decoded = true;
@@ -1389,9 +1396,10 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         try {
             engine.beginHandshake();
             wrapNonAppData(ctx, false);
-            ctx.flush();
-        } catch (Exception e) {
-            notifyHandshakeFailure(e);
+        } catch (SSLException e) {
+            setHandshakeFailure(ctx, e);
+        } finally {
+           forceFlush(ctx);
         }
 
         // Set timeout if necessary.
@@ -1417,6 +1425,11 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                 timeoutFuture.cancel(false);
             }
         });
+    }
+
+    private void forceFlush(ChannelHandlerContext ctx) {
+        needsFlush = false;
+        ctx.flush();
     }
 
     /**

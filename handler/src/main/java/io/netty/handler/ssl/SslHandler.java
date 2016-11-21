@@ -529,9 +529,9 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
         try {
             wrapAndFlush(ctx);
-        } catch (SSLException e) {
-            setHandshakeFailure(ctx, e);
-            throw e;
+        } catch (Throwable cause) {
+            setHandshakeFailure(ctx, cause);
+            PlatformDependent.throwException(cause);
         }
     }
 
@@ -948,7 +948,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
             try {
                 firedChannelRead = unwrap(ctx, in, startOffset, totalLength) || firedChannelRead;
-            } catch (SSLException e) {
+            } catch (Throwable cause) {
                 try {
                     // We need to flush one time as there may be an alert that we should send to the remote peer because
                     // of the SSLException reported here.
@@ -957,9 +957,9 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                     logger.debug("SSLException during trying to call SSLEngine.wrap(...)" +
                             " because of an previous SSLException, ignoring...", ex);
                 } finally {
-                    setHandshakeFailure(ctx, e);
+                    setHandshakeFailure(ctx, cause);
                 }
-                throw e;
+                PlatformDependent.throwException(cause);
             }
         }
 
@@ -1242,26 +1242,30 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
      * Notify all the handshake futures about the failure during the handshake.
      */
     private void setHandshakeFailure(ChannelHandlerContext ctx, Throwable cause, boolean closeInbound) {
-        // Release all resources such as internal buffers that SSLEngine
-        // is managing.
-        engine.closeOutbound();
+        try {
+            // Release all resources such as internal buffers that SSLEngine
+            // is managing.
+            engine.closeOutbound();
 
-        if (closeInbound) {
-            try {
-                engine.closeInbound();
-            } catch (SSLException e) {
-                // only log in debug mode as it most likely harmless and latest chrome still trigger
-                // this all the time.
-                //
-                // See https://github.com/netty/netty/issues/1340
-                String msg = e.getMessage();
-                if (msg == null || !msg.contains("possible truncation attack")) {
-                    logger.debug("{} SSLEngine.closeInbound() raised an exception.", ctx.channel(), e);
+            if (closeInbound) {
+                try {
+                    engine.closeInbound();
+                } catch (SSLException e) {
+                    // only log in debug mode as it most likely harmless and latest chrome still trigger
+                    // this all the time.
+                    //
+                    // See https://github.com/netty/netty/issues/1340
+                    String msg = e.getMessage();
+                    if (msg == null || !msg.contains("possible truncation attack")) {
+                        logger.debug("{} SSLEngine.closeInbound() raised an exception.", ctx.channel(), e);
+                    }
                 }
             }
+            notifyHandshakeFailure(cause);
+        } finally {
+            // Ensure we remove and fail all pending writes in all cases and so release memory quickly.
+            pendingUnencryptedWrites.removeAndFailAll(cause);
         }
-        notifyHandshakeFailure(cause);
-        pendingUnencryptedWrites.removeAndFailAll(cause);
     }
 
     private void notifyHandshakeFailure(Throwable cause) {
